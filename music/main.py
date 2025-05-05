@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 import logging
 from telegram import Update, InlineQueryResultArticle, InputTextMessageContent
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, InlineQueryHandler
@@ -32,31 +33,35 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
+# Suppress unnecessary logs from httpx
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
 
-def convert_link(link: str): # returns the music item containing url, description etc
+def convert_link(link: str):
+    """
+    Converts a link between Spotify and YouTube Music.
+    Returns the first search result (music item) or an error message.
+    """
     # Detect the source service
     for cls in [SpotifyService, YoutubeMusicService]:
         if cls.detect(link):
             from_service = cls.name
             break
     else:
-        return "Unsupported link. Please provide a valid Spotify or Youtube Music link."
+        return "Unsupported link. Please provide a valid Spotify or YouTube Music link."
 
-    # Convert the link
     try:
-        if (from_service == "spotify"): # duality, change if adding more services 
-            to_service = "youtube_music"
-        else:
-            to_service = "spotify"
+        # Determine the target service
+        to_service = "youtube_music" if from_service == "spotify" else "spotify"
 
+        # Perform the conversion
         converter = Converter.by_names(from_service_name=from_service, to_service_name=to_service)
         result = converter.convert(link)
 
-        # Access the URL from the first search result
+        # Check if there are results
         if hasattr(result, 'results') and len(result.results) > 0:
-            first_result = result.results[0] # get the first result
-            return first_result  # Return the music item 
+            return result.results[0]  # Return the first result
         else:
             return "No results found for the given link."
 
@@ -64,53 +69,82 @@ def convert_link(link: str): # returns the music item containing url, descriptio
         logger.error(f"Error during link conversion: {e}")
         return "An error occurred while converting the link. Please try again later."
 
-# Command handlers
+# Command Handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send a welcome message when the /start command is issued."""
     await update.message.reply_text("Welcome! Send me a Spotify or YouTube Music link, and I'll convert it for you.")
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE): # change to show more results mayb
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle regular chat messages."""
     user_message = update.message.text
     converted_link = convert_link(user_message)
-    await update.message.reply_text(converted_link.url)
 
-# inline function 
+    if isinstance(converted_link, str):  # Error message
+        await update.message.reply_text(converted_link)
+    else:
+        await update.message.reply_text(converted_link.url)
+
+# Inline Query Handler
 async def inline_convert(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle inline queries."""
     query = update.inline_query.query
-    if not query:
+    if not query:  # Empty query should not be handled
         return
 
     results = []
     try:
         converted_music = convert_link(query)
-        results.append(
-            InlineQueryResultArticle(
-                id=str(uuid4()),
-                thumbnail_url=converted_music.art_url,  # Add the album art as a thumbnail
-                title=converted_music.description1,  # Use the track title as the title
-                description=f"{converted_music.description2} - {converted_music.description3}",  # Use artist and album as the description
-                input_message_content=InputTextMessageContent(converted_music.url)  # Use the URL as the message content 
+
+        if isinstance(converted_music, str):  # Error message
+            results.append(
+                InlineQueryResultArticle(
+                    id=str(uuid4()),
+                    title="Error",
+                    input_message_content=InputTextMessageContent(converted_music),
+                )
             )
-        )
+        else:
+            # Add multiple results if available (e.g., top 3 matches)
+            for item in getattr(converted_music, 'results', [])[:3]:  # Limit to top 3 results
+                results.append(
+                    InlineQueryResultArticle(
+                        id=str(uuid4()),
+                        title=item.description1,
+                        description=f"{item.description2} - {item.description3}",
+                        thumbnail_url=item.art_url,
+                        input_message_content=InputTextMessageContent(item.url),
+                    )
+                )
 
     except Exception as e:
+        logger.error(f"Error during inline query: {e}")
         results.append(
             InlineQueryResultArticle(
                 id=str(uuid4()),
-                title='Error',
-                input_message_content=InputTextMessageContent("An error occurred while converting the link.")
+                title="Error",
+                input_message_content=InputTextMessageContent("An error occurred while processing your request."),
             )
         )
 
     await context.bot.answer_inline_query(update.inline_query.id, results)
 
-# Main function
+# Global Error Handler
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Log errors caused by updates."""
+    logger.error(msg="Exception while handling an update:", exc_info=context.error)
+
+# Main Function
 if __name__ == '__main__':
+    # Build the application
     application = ApplicationBuilder().token(tele_api_key).build()
 
-    # Handlers
+    # Register handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(InlineQueryHandler(inline_convert))
+
+    # Add global error handler
+    application.add_error_handler(error_handler)
 
     # Start polling
     application.run_polling()
